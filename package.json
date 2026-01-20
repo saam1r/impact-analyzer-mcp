@@ -1,0 +1,52 @@
+{
+  "name": "impact-analyzer-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for analyzing git branch impact - returns git diffs, changed files, and test structure for AI-powered analysis",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "impact-analyzer-mcp": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc && node dist/index.js",
+    "start": "node dist/index.js",
+    "prepare": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "git",
+    "impact-analysis",
+    "code-review",
+    "cursor",
+    "claude",
+    "ai"
+  ],
+  "author": "Sprinto",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sprinto/impact-analyzer-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sprinto/impact-analyzer-mcp/issues"
+  },
+  "homepage": "https://github.com/sprinto/impact-analyzer-mcp#readme",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "simple-git": "^3.27.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ]
+}
