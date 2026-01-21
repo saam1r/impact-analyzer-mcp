@@ -485,11 +485,106 @@ async function analyzeTestCoverage(branch: string, base: string = DEFAULT_BASE_B
   };
 }
 
+// Analyze diff content for specific code patterns that often cause bugs
+function analyzeDiffPatterns(diff: string): {
+  apiResponseChanges: string[];
+  potentialUndefinedIssues: string[];
+  changedFunctionNames: string[];
+  returnStatementChanges: string[];
+} {
+  const patterns = {
+    apiResponseChanges: [] as string[],
+    potentialUndefinedIssues: [] as string[],
+    changedFunctionNames: [] as string[],
+    returnStatementChanges: [] as string[]
+  };
+  
+  const lines = diff.split('\n');
+  let currentFile = '';
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    
+    // Track current file
+    if (line.startsWith('diff --git')) {
+      const match = line.match(/b\/(.+)$/);
+      if (match) currentFile = match[1];
+    }
+    
+    // Detect added lines (new code)
+    if (line.startsWith('+') && !line.startsWith('+++')) {
+      const code = line.substring(1);
+      
+      // Pattern 1: Arrays with potentially undefined values
+      // e.g., errors: [{ messages: response.err }] where response.err could be undefined
+      const undefinedArrayPattern = /\[\s*\{\s*\w+:\s*\w+\.(\w+)\s*\}\s*\]/;
+      const undefinedMatch = code.match(undefinedArrayPattern);
+      if (undefinedMatch) {
+        const propName = undefinedMatch[1];
+        // Common optional property names
+        if (['err', 'error', 'message', 'data', 'result', 'value'].includes(propName.toLowerCase())) {
+          patterns.potentialUndefinedIssues.push(
+            `${basename(currentFile)}: [{ key: obj.${propName} }] - If ${propName} is undefined, array is still truthy [{ key: undefined }]`
+          );
+        }
+      }
+      
+      // Pattern 2: Return statement changes with object restructuring
+      if (code.includes('return {') || code.includes('return{')) {
+        // Check if this is a response format
+        if (code.includes('success') || code.includes('error') || code.includes('data')) {
+          patterns.returnStatementChanges.push(`${basename(currentFile)}: Return format changed - verify all callers handle new format`);
+        }
+      }
+      
+      // Pattern 3: API response format changes
+      if ((code.includes('success:') || code.includes('errors:') || code.includes('data:')) && 
+          (code.includes('return') || code.includes('=>'))) {
+        patterns.apiResponseChanges.push(`${basename(currentFile)}: API response shape changed`);
+      }
+    }
+    
+    // Detect removed lines that had different return format
+    if (line.startsWith('-') && !line.startsWith('---')) {
+      const code = line.substring(1);
+      if (code.includes('return {') && (code.includes('success') || code.includes('data'))) {
+        // Check if next few lines have a different return format (added)
+        for (let j = i + 1; j < Math.min(i + 5, lines.length); j++) {
+          if (lines[j].startsWith('+') && lines[j].includes('return {')) {
+            patterns.apiResponseChanges.push(`${basename(currentFile)}: Return statement CHANGED - old format removed, new format added. Check ALL callers!`);
+            break;
+          }
+        }
+      }
+    }
+    
+    // Detect changed function definitions
+    const funcDefPattern = /^[+-]\s*(async\s+)?(function\s+(\w+)|const\s+(\w+)\s*=|(\w+)\s*[=:]\s*(async\s+)?\(|(\w+)\s*\([^)]*\)\s*{)/;
+    if ((line.startsWith('+') || line.startsWith('-')) && !line.startsWith('+++') && !line.startsWith('---')) {
+      const match = line.match(funcDefPattern);
+      if (match) {
+        const funcName = match[3] || match[4] || match[5] || match[7];
+        if (funcName && !patterns.changedFunctionNames.includes(funcName)) {
+          patterns.changedFunctionNames.push(funcName);
+        }
+      }
+    }
+  }
+  
+  // Deduplicate
+  patterns.apiResponseChanges = [...new Set(patterns.apiResponseChanges)];
+  patterns.potentialUndefinedIssues = [...new Set(patterns.potentialUndefinedIssues)];
+  patterns.returnStatementChanges = [...new Set(patterns.returnStatementChanges)];
+  
+  return patterns;
+}
+
 // Analyze risks and potential issues in the changes
 function analyzeRisksAndImpact(
   changedFiles: Array<{ path: string; status: string; additions: number; deletions: number }>, 
   testAnalysis: { relatedTests: any[]; missingTests: string[]; testCoverage: any },
-  dependencies: { direct: Record<string, string[]>; indirect: Record<string, string[]>; allAffected: string[] }
+  dependencies: { direct: Record<string, string[]>; indirect: Record<string, string[]>; allAffected: string[] },
+  diffContent: string = ''
 ): {
   riskLevel: 'Low' | 'Medium' | 'High' | 'Critical';
   breakingChanges: string[];
@@ -501,6 +596,7 @@ function analyzeRisksAndImpact(
   criticalFilesToTest: string[];
   missedConsiderations: string[];
   affectedByFile: Record<string, string[]>;
+  codePatternWarnings: string[];
 } {
   const risks = {
     riskLevel: 'Low' as 'Low' | 'Medium' | 'High' | 'Critical',
@@ -512,8 +608,40 @@ function analyzeRisksAndImpact(
     areasAffected: [] as string[],
     criticalFilesToTest: [] as string[],
     missedConsiderations: [] as string[],
-    affectedByFile: {} as Record<string, string[]>
+    affectedByFile: {} as Record<string, string[]>,
+    codePatternWarnings: [] as string[]
   };
+  
+  // Analyze diff for specific bug patterns
+  const diffPatterns = analyzeDiffPatterns(diffContent);
+  
+  // Add code pattern warnings
+  if (diffPatterns.potentialUndefinedIssues.length > 0) {
+    risks.codePatternWarnings.push('⚠️ POTENTIAL UNDEFINED/NULL ISSUES:');
+    diffPatterns.potentialUndefinedIssues.forEach(issue => {
+      risks.codePatternWarnings.push(`   • ${issue}`);
+      risks.codePatternWarnings.push(`     ↳ ASK: "What happens when this value is undefined? Will downstream code interpret it correctly?"`);
+    });
+  }
+  
+  if (diffPatterns.apiResponseChanges.length > 0) {
+    risks.codePatternWarnings.push('⚠️ API RESPONSE FORMAT CHANGED:');
+    diffPatterns.apiResponseChanges.forEach(change => {
+      risks.codePatternWarnings.push(`   • ${change}`);
+    });
+    risks.codePatternWarnings.push(`     ↳ HOW TO VERIFY: Search for ALL callers of this function (grep -r "functionName" src/), not just modified files`);
+    risks.codePatternWarnings.push(`     ↳ ASK: "Are there any other callers (sync jobs, background tasks, other services) that weren't updated?"`);
+  }
+  
+  if (diffPatterns.changedFunctionNames.length > 0) {
+    risks.codePatternWarnings.push('📍 CHANGED FUNCTIONS - Find ALL callers:');
+    diffPatterns.changedFunctionNames.slice(0, 5).forEach(funcName => {
+      risks.codePatternWarnings.push(`   • ${funcName}() → Run: grep -r "${funcName}" src/`);
+    });
+    if (diffPatterns.changedFunctionNames.length > 5) {
+      risks.codePatternWarnings.push(`   • ... and ${diffPatterns.changedFunctionNames.length - 5} more functions`);
+    }
+  }
   
   // Store which files are affected by each changed file
   risks.affectedByFile = dependencies.direct;
@@ -1105,7 +1233,7 @@ async function analyzePR(branch: string, base: string = DEFAULT_BASE_BRANCH) {
   const dependencies = await findIndirectDependencies(changedFiles, repoRoot);
   
   // Analyze risks and potential issues
-  const riskAnalysis = analyzeRisksAndImpact(changedFiles, testAnalysis, dependencies);
+  const riskAnalysis = analyzeRisksAndImpact(changedFiles, testAnalysis, dependencies, diff);
   
   // Generate developer action items
   const actionItems = generateDeveloperActionItems(changedFiles, testAnalysis);
@@ -1323,6 +1451,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         testSteps.push(`${stepNum}. UI: Test Chrome/Safari/Firefox, test mobile/tablet, test keyboard navigation`);
       }
       
+      // Build code pattern warnings section
+      const codePatternSection = result.riskAnalysis.codePatternWarnings.length > 0 
+        ? `
+🔍 CODE PATTERN ANALYSIS (Potential Hidden Bugs)
+${result.riskAnalysis.codePatternWarnings.join('\n')}
+` : '';
+      
       // Concise output - PRESENT THIS AS-IS, DO NOT EXPAND
       const output = `
 ═══════════════════════════════════════════════════════════════════
@@ -1339,6 +1474,7 @@ ${allRisks.join('\n')}
 ` : `
 ✅ NO MAJOR RISKS IDENTIFIED
 `}
+${codePatternSection}
 ${result.riskAnalysis.criticalFilesToTest.length > 0 ? `
 📁 FILES NEEDING EXTRA ATTENTION
 ${result.riskAnalysis.criticalFilesToTest.slice(0, 5).map(f => `• ${f}`).join('\n')}
