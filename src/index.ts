@@ -35,10 +35,39 @@ async function findRepoRoot(): Promise<string> {
   }
 }
 
+// Ensure branch is available (fetch from remote if needed)
+async function ensureBranchAvailable(branch: string): Promise<string> {
+  try {
+    // First, fetch the branch from origin to ensure we have latest
+    await git.fetch(['origin', branch]);
+  } catch (error) {
+    // Branch might not exist on remote or already fetched, continue
+  }
+  
+  // Check if local branch exists
+  try {
+    await git.revparse(['--verify', branch]);
+    return branch;
+  } catch (error) {
+    // Local branch doesn't exist, try origin/branch
+    try {
+      await git.revparse(['--verify', `origin/${branch}`]);
+      return `origin/${branch}`;
+    } catch (error2) {
+      // Return original, let it fail with better error
+      return branch;
+    }
+  }
+}
+
 // Get diff between branches
 async function getDiff(base: string, head: string): Promise<string> {
   try {
-    const diff = await git.diff([`${base}...${head}`]);
+    // Ensure both branches are available
+    const resolvedBase = await ensureBranchAvailable(base);
+    const resolvedHead = await ensureBranchAvailable(head);
+    
+    const diff = await git.diff([`${resolvedBase}...${resolvedHead}`]);
     // Limit to MAX_DIFF_SIZE to avoid token limits
     return diff.slice(0, MAX_DIFF_SIZE);
   } catch (error) {
@@ -49,7 +78,11 @@ async function getDiff(base: string, head: string): Promise<string> {
 // Get list of changed files with status
 async function getChangedFiles(base: string, head: string) {
   try {
-    const diff = await git.diffSummary([`${base}...${head}`]);
+    // Ensure both branches are available
+    const resolvedBase = await ensureBranchAvailable(base);
+    const resolvedHead = await ensureBranchAvailable(head);
+    
+    const diff = await git.diffSummary([`${resolvedBase}...${resolvedHead}`]);
     return diff.files.map(file => ({
       path: file.file,
       status: file.binary ? 'B' : 'M',
@@ -453,7 +486,11 @@ async function analyzeTestCoverage(branch: string, base: string = DEFAULT_BASE_B
 }
 
 // Analyze risks and potential issues in the changes
-function analyzeRisksAndImpact(changedFiles: Array<{ path: string; status: string; additions: number; deletions: number }>, testAnalysis: { relatedTests: any[]; missingTests: string[]; testCoverage: any }): {
+function analyzeRisksAndImpact(
+  changedFiles: Array<{ path: string; status: string; additions: number; deletions: number }>, 
+  testAnalysis: { relatedTests: any[]; missingTests: string[]; testCoverage: any },
+  dependencies: { direct: Record<string, string[]>; indirect: Record<string, string[]>; allAffected: string[] }
+): {
   riskLevel: 'Low' | 'Medium' | 'High' | 'Critical';
   breakingChanges: string[];
   regressionRisks: string[];
@@ -463,6 +500,7 @@ function analyzeRisksAndImpact(changedFiles: Array<{ path: string; status: strin
   areasAffected: string[];
   criticalFilesToTest: string[];
   missedConsiderations: string[];
+  affectedByFile: Record<string, string[]>;
 } {
   const risks = {
     riskLevel: 'Low' as 'Low' | 'Medium' | 'High' | 'Critical',
@@ -473,8 +511,12 @@ function analyzeRisksAndImpact(changedFiles: Array<{ path: string; status: strin
     dataIntegrityRisks: [] as string[],
     areasAffected: [] as string[],
     criticalFilesToTest: [] as string[],
-    missedConsiderations: [] as string[]
+    missedConsiderations: [] as string[],
+    affectedByFile: {} as Record<string, string[]>
   };
+  
+  // Store which files are affected by each changed file
+  risks.affectedByFile = dependencies.direct;
   
   // Detect file types and patterns
   const hasSchemaChanges = changedFiles.some(f => 
@@ -553,134 +595,216 @@ function analyzeRisksAndImpact(changedFiles: Array<{ path: string; status: strin
   if (hasAuthChanges) risks.areasAffected.push('Authentication/Authorization');
   if (hasStateManagement) risks.areasAffected.push('State Management');
   
-  // Breaking changes potential
+  // Helper to generate test suggestion based on file name
+  const getTestSuggestion = (filePath: string): string => {
+    const fileName = basename(filePath).toLowerCase();
+    const dirPath = filePath.toLowerCase();
+    
+    // Page components
+    if (fileName.includes('page')) {
+      const pageName = basename(filePath).replace(/Page\.(js|jsx|tsx|ts)$/i, '').replace(/([A-Z])/g, ' $1').trim();
+      return `Open ${pageName} page and test the main user flow`;
+    }
+    // Drawer components
+    if (fileName.includes('drawer')) {
+      return `Open the drawer and verify it displays correctly`;
+    }
+    // Table/List components
+    if (fileName.includes('table') || fileName.includes('list') || fileName.includes('config')) {
+      return `Verify table/list displays data correctly with sorting/filtering`;
+    }
+    // Form components
+    if (fileName.includes('form')) {
+      return `Test form submission with valid and invalid data`;
+    }
+    // Modal/Dialog
+    if (fileName.includes('modal') || fileName.includes('dialog')) {
+      return `Open modal, verify content, test close actions`;
+    }
+    // GraphQL queries
+    if (dirPath.includes('.gql') || dirPath.includes('graphql') || dirPath.includes('queries')) {
+      return `Test the GraphQL query in Playground, verify response format`;
+    }
+    // Backend modules
+    if (dirPath.includes('module') || dirPath.includes('service')) {
+      return `Test API endpoint with various inputs, check response`;
+    }
+    // Utils/Helpers
+    if (dirPath.includes('utils') || dirPath.includes('helper') || dirPath.includes('shared')) {
+      return `Verify all consuming components still work correctly`;
+    }
+    // Default
+    return `Verify feature works as expected`;
+  };
+  
+  // Breaking changes potential - BE SPECIFIC with HOW TO TEST
   if (hasSchemaChanges) {
-    risks.breakingChanges.push('GraphQL schema modified - verify all queries/mutations still work');
-    risks.breakingChanges.push('Check if frontend queries need updates');
-    risks.criticalFilesToTest.push(...changedFiles.filter(f => f.path.includes('schema')).map(f => f.path));
+    const schemaFiles = changedFiles.filter(f => f.path.includes('schema')).map(f => f.path);
+    const schemaConsumers = schemaFiles.flatMap(f => dependencies.direct[f] || []);
+    if (schemaConsumers.length > 0) {
+      const consumerNames = schemaConsumers.slice(0, 3).map(f => basename(f));
+      risks.breakingChanges.push(`schema.graphql changed → Used by: ${consumerNames.join(', ')}`);
+      risks.breakingChanges.push(`  ↳ HOW TO TEST: Run GraphQL query in Playground, then test ${consumerNames[0]} to verify data loads`);
+    } else {
+      risks.breakingChanges.push(`schema.graphql changed → Check frontend queries that use modified types`);
+      risks.breakingChanges.push(`  ↳ HOW TO TEST: Open GraphQL Playground, run affected queries, verify response format`);
+    }
+    risks.criticalFilesToTest.push(...schemaFiles);
+    risks.criticalFilesToTest.push(...schemaConsumers.slice(0, 5));
   }
   
   if (hasAPIChanges) {
-    risks.breakingChanges.push('API changes detected - verify backward compatibility');
-    risks.breakingChanges.push('Check if any consumers depend on modified API contracts');
-    risks.criticalFilesToTest.push(...changedFiles.filter(f => f.path.includes('.gql.js') || f.path.includes('/api/')).map(f => f.path));
+    const apiFiles = changedFiles.filter(f => f.path.includes('.gql.js') || f.path.includes('/api/')).map(f => f.path);
+    apiFiles.forEach(apiFile => {
+      const consumers = dependencies.direct[apiFile] || [];
+      const apiName = basename(apiFile);
+      if (consumers.length > 0) {
+        const consumerNames = consumers.slice(0, 3).map(f => basename(f));
+        risks.breakingChanges.push(`${apiName} changed → Used by: ${consumerNames.join(', ')}`);
+        risks.breakingChanges.push(`  ↳ HOW TO TEST: ${getTestSuggestion(consumers[0])}`);
+        risks.criticalFilesToTest.push(...consumers.slice(0, 3));
+      } else {
+        risks.breakingChanges.push(`${apiName} changed → Verify frontend calls to this query`);
+        risks.breakingChanges.push(`  ↳ HOW TO TEST: Find where this query is used, test that feature`);
+      }
+    });
+    risks.criticalFilesToTest.push(...apiFiles);
   }
   
   if (hasFilesDeletion) {
-    risks.breakingChanges.push('Significant code deletion detected - verify no dependent code breaks');
-    risks.regressionRisks.push('Removed functionality may be referenced elsewhere');
+    const deletedFiles = changedFiles.filter(f => f.deletions > f.additions && f.deletions > 50);
+    deletedFiles.forEach(f => {
+      risks.breakingChanges.push(`Large deletion in ${basename(f.path)} (-${f.deletions} lines)`);
+      risks.breakingChanges.push(`  ↳ HOW TO TEST: Search codebase for imports of deleted functions, test those features`);
+    });
   }
   
-  // Regression risks
+  // Regression risks - BE SPECIFIC with HOW TO TEST
   if (hasUtilityChanges) {
-    risks.regressionRisks.push('Utility/helper functions modified - test ALL usages across codebase');
-    risks.regressionRisks.push('Shared utilities may have multiple consumers that need retesting');
-    risks.criticalFilesToTest.push(...changedFiles.filter(f => f.path.includes('/utils/') || f.path.includes('/helpers/')).map(f => f.path));
+    const utilFiles = changedFiles.filter(f => f.path.includes('/utils/') || f.path.includes('/helpers/') || f.path.includes('/shared/')).map(f => f.path);
+    utilFiles.forEach(utilFile => {
+      const consumers = dependencies.direct[utilFile] || [];
+      const utilName = basename(utilFile);
+      if (consumers.length > 0) {
+        const consumerNames = consumers.slice(0, 4).map(f => basename(f));
+        risks.regressionRisks.push(`${utilName} changed → Used by: ${consumerNames.join(', ')}${consumers.length > 4 ? ` (+${consumers.length - 4} more)` : ''}`);
+        // Add specific test suggestion for first consumer
+        risks.regressionRisks.push(`  ↳ HOW TO TEST: ${getTestSuggestion(consumers[0])}`);
+        risks.criticalFilesToTest.push(...consumers.slice(0, 4));
+      } else {
+        risks.regressionRisks.push(`${utilName} changed → Check where this utility is imported`);
+        risks.regressionRisks.push(`  ↳ HOW TO TEST: Search for "${utilName.replace(/\.(js|ts|jsx|tsx)$/, '')}" in codebase, test those features`);
+      }
+    });
+    risks.criticalFilesToTest.push(...utilFiles);
   }
   
   if (hasStateManagement) {
-    risks.regressionRisks.push('State management changed - verify all components consuming this state');
-    risks.regressionRisks.push('Check for side effects in related components');
+    const stateFiles = changedFiles.filter(f => f.path.includes('redux') || f.path.includes('store') || f.path.includes('context')).map(f => f.path);
+    stateFiles.forEach(stateFile => {
+      const consumers = dependencies.direct[stateFile] || [];
+      if (consumers.length > 0) {
+        const consumerNames = consumers.slice(0, 4).map(f => basename(f));
+        risks.regressionRisks.push(`${basename(stateFile)} changed → Components using this state: ${consumerNames.join(', ')}`);
+        risks.regressionRisks.push(`  ↳ HOW TO TEST: Navigate to each component, verify data displays and updates correctly`);
+      }
+    });
   }
   
   if (hasUIComponents && hasMultipleFiles) {
-    risks.regressionRisks.push('Multiple UI components changed - test inter-component interactions');
-    risks.regressionRisks.push('Verify parent-child component relationships still work');
+    const componentFiles = changedFiles.filter(f => f.path.includes('/components/')).map(f => f.path);
+    const componentNames = componentFiles.slice(0, 5).map(f => basename(f));
+    risks.regressionRisks.push(`Multiple UI changes: ${componentNames.join(', ')}${componentFiles.length > 5 ? ` (+${componentFiles.length - 5} more)` : ''}`);
+    risks.regressionRisks.push(`  ↳ HOW TO TEST: Test the feature that uses these components end-to-end`);
   }
   
   if (testAnalysis.missingTests.length > 0) {
-    risks.regressionRisks.push(`${testAnalysis.missingTests.length} files changed without test coverage - HIGH regression risk`);
+    const filesWithoutTests = testAnalysis.missingTests.slice(0, 3).map(f => basename(f));
+    risks.regressionRisks.push(`No tests for: ${filesWithoutTests.join(', ')}${testAnalysis.missingTests.length > 3 ? ` (+${testAnalysis.missingTests.length - 3} more)` : ''}`);
+    risks.regressionRisks.push(`  ↳ HOW TO TEST: Manually test these files thoroughly before merge, or add unit tests`);
   }
   
-  // Performance concerns
+  // Performance concerns - BE SPECIFIC with HOW TO TEST
   if (hasDBChanges) {
-    risks.performanceConcerns.push('Database query changes - verify query performance with production-like data');
-    risks.performanceConcerns.push('Check if new queries need indexes');
-    risks.performanceConcerns.push('Test with large datasets (1000+ records)');
-    risks.dataIntegrityRisks.push('Database changes require careful testing of data constraints');
+    const dbFiles = changedFiles.filter(f => f.path.includes('/models/') || f.path.includes('module.js') || f.path.includes('Module.js'));
+    dbFiles.forEach(f => {
+      risks.performanceConcerns.push(`${basename(f.path)} has DB changes`);
+      risks.performanceConcerns.push(`  ↳ HOW TO TEST: Create 1000+ test records, trigger the query, check Network tab for response time (<500ms ideal)`);
+    });
   }
   
-  const hasJSONBSearch = changedFiles.some(f => {
-    return f.path.includes('module.js') || f.path.includes('gql.js');
-  });
-  
-  if (hasJSONBSearch) {
-    risks.performanceConcerns.push('JSONB queries detected - may be slow on large datasets without proper indexing');
-    risks.performanceConcerns.push('Consider adding GIN index for JSONB search performance');
-    risks.missedConsiderations.push('JSONB search performance not optimized - add database indexes');
+  const jsonbFiles = changedFiles.filter(f => f.path.includes('module.js') || f.path.includes('gql.js'));
+  if (jsonbFiles.length > 0) {
+    risks.performanceConcerns.push(`JSONB/DB queries in ${jsonbFiles.map(f => basename(f.path)).join(', ')}`);
+    risks.performanceConcerns.push(`  ↳ HOW TO TEST: Test search/filter with large dataset, if slow consider adding GIN index`);
   }
   
-  if (isLargeChange) {
-    risks.performanceConcerns.push('Large change detected - profile memory usage and performance impact');
-  }
-  
-  // Security concerns
+  // Security concerns - BE SPECIFIC with HOW TO TEST
   if (hasAuthChanges) {
-    risks.securityConcerns.push('Authentication/authorization logic changed - CRITICAL security review needed');
-    risks.securityConcerns.push('Verify users cannot access unauthorized resources');
-    risks.securityConcerns.push('Test with different user roles and permission levels');
-    risks.criticalFilesToTest.push(...changedFiles.filter(f => f.path.toLowerCase().includes('auth') || f.path.toLowerCase().includes('permission')).map(f => f.path));
+    const authFiles = changedFiles.filter(f => f.path.toLowerCase().includes('auth') || f.path.toLowerCase().includes('permission'));
+    authFiles.forEach(f => {
+      risks.securityConcerns.push(`${basename(f.path)} changed (auth/permission)`);
+      risks.securityConcerns.push(`  ↳ HOW TO TEST: Login as admin → test feature, then login as regular user → verify access is restricted, then try as guest`);
+    });
+    risks.criticalFilesToTest.push(...authFiles.map(f => f.path));
   }
   
-  if (hasAPIChanges || hasDBChanges) {
-    risks.securityConcerns.push('Test for SQL injection vulnerabilities');
-    risks.securityConcerns.push('Verify input validation and sanitization');
-    risks.securityConcerns.push('Check for proper error handling (no sensitive data exposure)');
-  }
-  
-  const hasUserInput = changedFiles.some(f => 
-    f.path.includes('form') || 
-    f.path.includes('input') ||
-    f.path.includes('search')
+  const inputFiles = changedFiles.filter(f => 
+    f.path.includes('search') || f.path.includes('Search') ||
+    f.path.includes('form') || f.path.includes('Form') ||
+    f.path.includes('input') || f.path.includes('Input')
   );
   
-  if (hasUserInput) {
-    risks.securityConcerns.push('User input handling modified - test XSS and injection attacks');
-    risks.securityConcerns.push('Verify special characters are properly escaped');
+  if (inputFiles.length > 0) {
+    risks.securityConcerns.push(`User input in ${inputFiles.map(f => basename(f.path)).join(', ')}`);
+    risks.securityConcerns.push(`  ↳ HOW TO TEST: Enter "'; DROP TABLE--" in input field (SQL injection), enter "<script>alert('x')</script>" (XSS), verify no errors and input is escaped`);
+  } else if (hasAPIChanges || hasDBChanges) {
+    risks.securityConcerns.push(`API/DB changes detected`);
+    risks.securityConcerns.push(`  ↳ HOW TO TEST: Find any input field that sends data to changed API, test with "'; DROP TABLE--"`);
   }
   
-  // Data integrity risks
+  // Data integrity risks - BE SPECIFIC with HOW TO TEST
   if (hasDBChanges) {
-    risks.dataIntegrityRisks.push('Verify data migrations work correctly (up AND down)');
-    risks.dataIntegrityRisks.push('Test rollback scenarios');
-    risks.dataIntegrityRisks.push('Ensure no data loss during migration');
+    const moduleFiles = changedFiles.filter(f => f.path.includes('module.js') || f.path.includes('Module.js'));
+    if (moduleFiles.length > 0) {
+      risks.dataIntegrityRisks.push(`DB logic in ${moduleFiles.map(f => basename(f.path)).join(', ')}`);
+      risks.dataIntegrityRisks.push(`  ↳ HOW TO TEST: Submit form with empty fields, with special chars (!@#$%^&*), with very long text (500+ chars)`);
+    }
   }
   
-  const hasDataTransformation = changedFiles.some(f =>
-    f.path.includes('transform') ||
-    f.path.includes('mapper') ||
-    f.path.includes('converter')
+  const transformFiles = changedFiles.filter(f =>
+    f.path.includes('transform') || f.path.includes('Transform') ||
+    f.path.includes('utils') || f.path.includes('Utils')
   );
   
-  if (hasDataTransformation) {
-    risks.dataIntegrityRisks.push('Data transformation logic changed - verify data integrity end-to-end');
-    risks.dataIntegrityRisks.push('Test with edge cases (null, empty, special characters)');
+  if (transformFiles.length > 0 && !hasUtilityChanges) {
+    risks.dataIntegrityRisks.push(`Data transformation in ${transformFiles.map(f => basename(f.path)).join(', ')}`);
+    risks.dataIntegrityRisks.push(`  ↳ HOW TO TEST: Check that output data format hasn't changed, compare before/after screenshots`);
   }
   
-  // Missed considerations
+  // Missed considerations - BE SPECIFIC
   if (hasConfigChanges) {
-    risks.missedConsiderations.push('Update environment variable documentation and .env.example');
-    risks.missedConsiderations.push('Notify team of any new configuration requirements');
+    const configFiles = changedFiles.filter(f => f.path.includes('config') || f.path.includes('.env') || f.path.includes('package.json'));
+    risks.missedConsiderations.push(`Config changed (${configFiles.map(f => basename(f.path)).join(', ')}) → Update .env.example and notify team`);
   }
   
   if (hasSchemaChanges && !changedFiles.some(f => f.path.includes('test'))) {
-    risks.missedConsiderations.push('GraphQL schema changed but no test updates detected');
+    risks.missedConsiderations.push(`schema.graphql changed but no test file updated → Add/update GraphQL tests`);
   }
   
-  const hasDebounce = changedFiles.some(f => f.path.includes('Page.js') || f.path.includes('component'));
-  if (hasDebounce) {
-    risks.missedConsiderations.push('If using debounce/timers - verify cleanup on component unmount (memory leaks)');
-    risks.missedConsiderations.push('Test rapid user interactions (race conditions)');
+  const pageFiles = changedFiles.filter(f => f.path.includes('Page.js') || f.path.includes('Page.tsx'));
+  if (pageFiles.length > 0) {
+    risks.missedConsiderations.push(`${pageFiles.map(f => basename(f.path)).join(', ')} → If using debounce/timers, verify cleanup on unmount`);
   }
   
-  if (hasUIComponents) {
-    risks.missedConsiderations.push('Test browser compatibility (Chrome, Firefox, Safari)');
-    risks.missedConsiderations.push('Test responsive design on mobile/tablet');
-    risks.missedConsiderations.push('Verify accessibility (keyboard navigation, screen readers)');
+  // Only add browser testing reminder for specific UI changes, not generically
+  const uiComponentFiles = changedFiles.filter(f => f.path.includes('/components/') && (f.path.endsWith('.js') || f.path.endsWith('.jsx') || f.path.endsWith('.tsx')));
+  if (uiComponentFiles.length > 0) {
+    risks.missedConsiderations.push(`UI changes in ${uiComponentFiles.slice(0, 3).map(f => basename(f.path)).join(', ')} → Test Chrome, Safari, Firefox + mobile`);
   }
   
-  if (testAnalysis.testCoverage.percentage < 70) {
-    risks.missedConsiderations.push(`Test coverage is ${testAnalysis.testCoverage.percentage}% - add tests before merging`);
+  if (testAnalysis.testCoverage.percentage < 70 && testAnalysis.missingTests.length > 0) {
+    risks.missedConsiderations.push(`Test coverage ${testAnalysis.testCoverage.percentage}% → Add tests for ${testAnalysis.missingTests.slice(0, 2).map(f => basename(f)).join(', ')}`);
   }
   
   return risks;
@@ -977,8 +1101,11 @@ async function analyzePR(branch: string, base: string = DEFAULT_BASE_BRANCH) {
   // Get test analysis for action items
   const testAnalysis = await findRelatedTests(changedFiles, repoRoot);
   
+  // Get indirect dependencies for risk analysis
+  const dependencies = await findIndirectDependencies(changedFiles, repoRoot);
+  
   // Analyze risks and potential issues
-  const riskAnalysis = analyzeRisksAndImpact(changedFiles, testAnalysis);
+  const riskAnalysis = analyzeRisksAndImpact(changedFiles, testAnalysis, dependencies);
   
   // Generate developer action items
   const actionItems = generateDeveloperActionItems(changedFiles, testAnalysis);
@@ -1119,114 +1246,110 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         'Critical': '🔴'
       };
       
-      // Build impact statements
+      // Build impact statements - "You changed X, it affects Y because Z"
       const impactStatements: string[] = [];
-      
-      // Generate "You changed X, it affects Y because Z" statements
       const changedFilesList = result.changedFiles.split('\n').filter(f => f.trim());
-      const filesByType: Record<string, string[]> = {};
       
-      changedFilesList.forEach(file => {
-        const filePath = file.split('\t')[1];
-        if (!filePath) return;
-        
-        if (filePath.includes('schema.graphql')) {
-          if (!filesByType['GraphQL Schema']) filesByType['GraphQL Schema'] = [];
-          filesByType['GraphQL Schema'].push(filePath);
-        } else if (filePath.includes('.gql.js')) {
-          if (!filesByType['GraphQL Queries']) filesByType['GraphQL Queries'] = [];
-          filesByType['GraphQL Queries'].push(filePath);
-        } else if (filePath.includes('module.js') || filePath.includes('Module.js')) {
-          if (!filesByType['Backend Modules']) filesByType['Backend Modules'] = [];
-          filesByType['Backend Modules'].push(filePath);
-        } else if (filePath.includes('/components/')) {
-          if (!filesByType['Frontend Components']) filesByType['Frontend Components'] = [];
-          filesByType['Frontend Components'].push(filePath);
-        } else if (filePath.includes('/utils/') || filePath.includes('/shared/')) {
-          if (!filesByType['Shared Utilities']) filesByType['Shared Utilities'] = [];
-          filesByType['Shared Utilities'].push(filePath);
-        }
-      });
+      // Categorize files
+      const hasSchema = changedFilesList.some(f => f.includes('schema.graphql') || f.includes('schema.gql'));
+      const gqlFiles = changedFilesList.filter(f => f.includes('.gql.js') || f.includes('.gql.ts'));
+      const moduleFiles = changedFilesList.filter(f => f.includes('module.js') || f.includes('Module.js') || f.includes('module.ts'));
+      const componentFiles = changedFilesList.filter(f => f.includes('/components/'));
+      const utilFiles = changedFilesList.filter(f => f.includes('/utils/') || f.includes('/shared/') || f.includes('/helpers/'));
+      const pageFiles = changedFilesList.filter(f => f.includes('Page.js') || f.includes('Page.tsx'));
       
-      // Generate impact statements based on file types
-      if (filesByType['GraphQL Schema']) {
-        impactStatements.push(`• You modified **GraphQL Schema** → This affects ALL queries/mutations using these types. Frontend queries may break if they request removed/renamed fields.`);
+      // Generate specific impact statements
+      if (hasSchema) {
+        impactStatements.push(`**GraphQL Schema Changed** → ALL queries/mutations using modified types may break. Check frontend queries.`);
+      }
+      if (gqlFiles.length > 0) {
+        impactStatements.push(`**GraphQL Queries Changed** (${gqlFiles.length} files) → API contract changed. Verify frontend calls.`);
+      }
+      if (moduleFiles.length > 0) {
+        impactStatements.push(`**Backend Modules Changed** (${moduleFiles.length} files) → Business logic affected. Test with real data volumes.`);
+      }
+      if (utilFiles.length > 0) {
+        impactStatements.push(`**Shared Utils Changed** → Used in MULTIPLE places. May break unrelated features.`);
+      }
+      if (componentFiles.length > 0) {
+        impactStatements.push(`**UI Components Changed** (${componentFiles.length} files) → Test across browsers and screen sizes.`);
+      }
+      if (pageFiles.length > 0) {
+        impactStatements.push(`**Page Components Changed** → Test complete user flows on these pages.`);
       }
       
-      if (filesByType['GraphQL Queries']) {
-        impactStatements.push(`• You modified **GraphQL Queries** (${filesByType['GraphQL Queries'].length} file${filesByType['GraphQL Queries'].length > 1 ? 's' : ''}) → This changes the API contract. Any frontend code calling these queries needs verification.`);
+      // Build risks section - only if there are risks
+      const allRisks: string[] = [];
+      if (result.riskAnalysis.breakingChanges.length > 0) {
+        allRisks.push('⚠️ BREAKING CHANGES:');
+        result.riskAnalysis.breakingChanges.forEach(r => allRisks.push(`   • ${r}`));
+      }
+      if (result.riskAnalysis.regressionRisks.length > 0) {
+        allRisks.push('🔄 REGRESSION RISKS:');
+        result.riskAnalysis.regressionRisks.forEach(r => allRisks.push(`   • ${r}`));
+      }
+      if (result.riskAnalysis.performanceConcerns.length > 0) {
+        allRisks.push('⚡ PERFORMANCE:');
+        result.riskAnalysis.performanceConcerns.forEach(r => allRisks.push(`   • ${r}`));
+      }
+      if (result.riskAnalysis.securityConcerns.length > 0) {
+        allRisks.push('🔒 SECURITY:');
+        result.riskAnalysis.securityConcerns.forEach(r => allRisks.push(`   • ${r}`));
+      }
+      if (result.riskAnalysis.missedConsiderations.length > 0) {
+        allRisks.push('🤔 MAY HAVE MISSED:');
+        result.riskAnalysis.missedConsiderations.forEach(r => allRisks.push(`   • ${r}`));
       }
       
-      if (filesByType['Backend Modules']) {
-        impactStatements.push(`• You modified **Backend Modules** (${filesByType['Backend Modules'].length} file${filesByType['Backend Modules'].length > 1 ? 's' : ''}) → This affects business logic and database operations. Test with production-like data volumes.`);
+      // Build test steps based on risks
+      const testSteps: string[] = [];
+      let stepNum = 1;
+      
+      if (result.riskAnalysis.securityConcerns.length > 0) {
+        testSteps.push(`${stepNum}. SECURITY: Test with different user roles, try SQL injection ('; DROP TABLE--), try XSS (<script>alert('x')</script>)`);
+        stepNum++;
+      }
+      if (result.riskAnalysis.performanceConcerns.length > 0) {
+        testSteps.push(`${stepNum}. PERFORMANCE: Test with 1000+ records, monitor query time in network tab`);
+        stepNum++;
+      }
+      if (result.riskAnalysis.breakingChanges.length > 0 || result.riskAnalysis.regressionRisks.length > 0) {
+        testSteps.push(`${stepNum}. REGRESSION: Test complete user flow, verify existing features still work`);
+        stepNum++;
+      }
+      testSteps.push(`${stepNum}. CORE: Test main feature works, test edge cases (empty, null, special chars)`);
+      stepNum++;
+      if (componentFiles.length > 0 || pageFiles.length > 0) {
+        testSteps.push(`${stepNum}. UI: Test Chrome/Safari/Firefox, test mobile/tablet, test keyboard navigation`);
       }
       
-      if (filesByType['Frontend Components']) {
-        impactStatements.push(`• You modified **${filesByType['Frontend Components'].length} Frontend Component${filesByType['Frontend Components'].length > 1 ? 's' : ''}** → This affects user interface. Test across browsers, screen sizes, and user permissions.`);
-      }
-      
-      if (filesByType['Shared Utilities']) {
-        impactStatements.push(`• You modified **Shared Utilities** → These are used in MULTIPLE places. Changes here can cause unexpected breaks in seemingly unrelated features.`);
-      }
-      
-      // Format as ultra-concise, impact-focused report
+      // Concise output - PRESENT THIS AS-IS, DO NOT EXPAND
       const output = `
-# Branch Analysis: ${branch}
+═══════════════════════════════════════════════════════════════════
+BRANCH ANALYSIS: ${branch}
+Risk: ${riskEmoji[result.riskAnalysis.riskLevel]} ${result.riskAnalysis.riskLevel.toUpperCase()} | Files: ${result.summary.filesChanged} | Lines: +${result.summary.linesAdded}/-${result.summary.linesDeleted}
+═══════════════════════════════════════════════════════════════════
 
-**Risk Level**: ${riskEmoji[result.riskAnalysis.riskLevel]} **${result.riskAnalysis.riskLevel}** | **Files Changed**: ${result.summary.filesChanged} | **Ticket**: ${result.ticketNumber}
+📌 IMPACT OF YOUR CHANGES
+${impactStatements.length > 0 ? impactStatements.map(s => `• ${s}`).join('\n') : '• Standard changes with isolated impact'}
 
----
-
-## 1. What You Changed & Its Impact
-
-${impactStatements.length > 0 ? impactStatements.join('\n\n') : '• Standard code changes with isolated impact'}
-
-${result.riskAnalysis.areasAffected.length > 0 ? `\n**Systems Affected**: ${result.riskAnalysis.areasAffected.join(', ')}` : ''}
-
----
-
-## 2. Risky Areas You Should Know About
-
-${result.riskAnalysis.breakingChanges.length > 0 ? `### ⚠️ Breaking Changes\n${result.riskAnalysis.breakingChanges.map(r => `• ${r}`).join('\n')}\n` : ''}${result.riskAnalysis.regressionRisks.length > 0 ? `### 🔄 Regression Risks\n${result.riskAnalysis.regressionRisks.map(r => `• ${r}`).join('\n')}\n` : ''}${result.riskAnalysis.performanceConcerns.length > 0 ? `### ⚡ Performance Issues\n${result.riskAnalysis.performanceConcerns.map(r => `• ${r}`).join('\n')}\n` : ''}${result.riskAnalysis.securityConcerns.length > 0 ? `### 🔒 Security Risks\n${result.riskAnalysis.securityConcerns.map(r => `• ${r}`).join('\n')}\n` : ''}${result.riskAnalysis.dataIntegrityRisks.length > 0 ? `### 💾 Data Integrity\n${result.riskAnalysis.dataIntegrityRisks.map(r => `• ${r}`).join('\n')}\n` : ''}${result.riskAnalysis.missedConsiderations.length > 0 ? `### 🤔 Things You Might Have Missed\n${result.riskAnalysis.missedConsiderations.map(r => `• ${r}`).join('\n')}` : ''}
-${result.riskAnalysis.breakingChanges.length === 0 && result.riskAnalysis.regressionRisks.length === 0 && result.riskAnalysis.performanceConcerns.length === 0 && result.riskAnalysis.securityConcerns.length === 0 && result.riskAnalysis.dataIntegrityRisks.length === 0 && result.riskAnalysis.missedConsiderations.length === 0 ? '✅ **No major risks identified** - This looks like a safe change' : ''}
-
-${result.riskAnalysis.criticalFilesToTest.length > 0 ? `\n**Critical Files Needing Extra Attention**:\n${result.riskAnalysis.criticalFilesToTest.slice(0, 5).map(f => `• \`${f}\``).join('\n')}${result.riskAnalysis.criticalFilesToTest.length > 5 ? `\n• ... and ${result.riskAnalysis.criticalFilesToTest.length - 5} more` : ''}` : ''}
-
----
-
-## 3. Test Steps to Verify Your Changes
-
-${result.riskAnalysis.securityConcerns.length > 0 ? `### 🔒 Security Testing (CRITICAL)
-1. Test with different user roles (admin, regular user, restricted user)
-2. Try SQL injection: Enter \`'; DROP TABLE--\` in search/input fields
-3. Try XSS: Enter \`<script>alert('test')</script>\` in text fields
-4. Verify unauthorized users cannot access new features
-` : ''}${result.riskAnalysis.performanceConcerns.length > 0 ? `### ⚡ Performance Testing
-1. Test with large datasets (1000+ records)
-2. Monitor network tab - check query execution time
-3. Verify pagination works correctly with search/filters
-` : ''}${result.riskAnalysis.breakingChanges.length > 0 || result.riskAnalysis.regressionRisks.length > 0 ? `### 🔄 Regression Testing
-1. Test the complete user flow from start to finish
-2. Verify existing features that use modified files still work
-3. Test edge cases: empty states, no data, invalid inputs
-` : ''}### ✅ Core Functionality
-1. Test the main feature you built works as expected
-2. Test with realistic data (not just test data)
-3. Verify error messages are user-friendly
-4. Test on different browsers (Chrome, Safari, Firefox)
-${filesByType['Frontend Components'] ? '5. Test on mobile and tablet screen sizes\n6. Test keyboard navigation and accessibility' : ''}
-
-${result.riskAnalysis.dataIntegrityRisks.length > 0 ? `### 💾 Database/Data Testing
-1. Verify data migrations work (if applicable)
-2. Test rollback scenario
-3. Check data integrity with edge cases (null, empty, special chars)
+${allRisks.length > 0 ? `
+🚨 RISKY AREAS TO WATCH
+${allRisks.join('\n')}
+` : `
+✅ NO MAJOR RISKS IDENTIFIED
+`}
+${result.riskAnalysis.criticalFilesToTest.length > 0 ? `
+📁 FILES NEEDING EXTRA ATTENTION
+${result.riskAnalysis.criticalFilesToTest.slice(0, 5).map(f => `• ${f}`).join('\n')}
 ` : ''}
----
+🧪 TEST STEPS
+${testSteps.join('\n')}
 
-## Changed Files
-\`\`\`
-${changedFilesList.slice(0, 15).join('\n')}${changedFilesList.length > 15 ? `\n... and ${changedFilesList.length - 15} more files` : ''}
-\`\`\`
+───────────────────────────────────────────────────────────────────
+Changed Files: ${changedFilesList.slice(0, 10).map(f => f.split('\t')[1] || f).join(', ')}${changedFilesList.length > 10 ? ` (+${changedFilesList.length - 10} more)` : ''}
+───────────────────────────────────────────────────────────────────
+[Present this report as-is. Do not expand or add additional sections.]
 `;
       
       return {
